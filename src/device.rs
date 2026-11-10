@@ -1,4 +1,4 @@
-use std::fs::{File, OpenOptions};
+use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
@@ -17,27 +17,19 @@ use crate::linux::{
     VIDIOC_S_FMT,
 };
 
+const MAX_ENTITIES: usize = 256;
+const MAX_PADS: u16 = 64;
+const MAX_LINKS: u16 = 256;
+const MAX_CAPTURE_BUFFERS: u32 = 8;
+const MAX_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
+
 pub struct Opened {
-    pub file: File,
+    pub file: std::fs::File,
 }
 
 impl Opened {
     pub fn rw(path: &Path) -> Result<Self> {
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .map(|file| Self { file })
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::PermissionDenied {
-                    err(format!(
-                        "Cannot open {}: {error}. The user needs access to video devices.",
-                        path.display()
-                    ))
-                } else {
-                    err(format!("Cannot open {}: {error}", path.display()))
-                }
-            })
+        crate::nodes::open_device(path).map(|file| Self { file })
     }
 
     fn fd(&self) -> i32 {
@@ -47,13 +39,17 @@ impl Opened {
 
 pub fn list_media_nodes(dir: &Path, only: Option<&Path>) -> Result<Vec<PathBuf>> {
     if let Some(path) = only {
-        if !path.exists() {
+        let resolved = crate::nodes::resolve_dev_node(path)?;
+        if crate::nodes::dev_node_kind(&resolved) != Some("media") {
             return Err(err(format!(
-                "Media device {} does not exist.",
-                path.display()
+                "--media must be a /dev/mediaN device, not {}.",
+                resolved.display()
             )));
         }
-        return Ok(vec![path.to_path_buf()]);
+        return Ok(vec![resolved]);
+    }
+    if dir != Path::new("/dev") {
+        return Err(err("MEDIA_DIR must be /dev."));
     }
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -76,7 +72,8 @@ pub fn list_media_nodes(dir: &Path, only: Option<&Path>) -> Result<Vec<PathBuf>>
             continue;
         };
         if !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit()) {
-            nodes.push((suffix.parse::<u32>().unwrap_or(u32::MAX), entry.path()));
+            let resolved = crate::nodes::resolve_dev_node(&entry.path())?;
+            nodes.push((suffix.parse::<u32>().unwrap_or(u32::MAX), resolved));
         }
     }
     nodes.sort_by_key(|(index, _)| *index);
@@ -90,7 +87,7 @@ pub fn read_graph(path: &Path) -> Result<Graph> {
     let mut desc: MediaEntityDesc = zeroed();
     desc.id = MEDIA_ENT_ID_FLAG_NEXT;
     loop {
-        if entities.len() > 512 {
+        if entities.len() >= MAX_ENTITIES {
             return Err(err("The media graph has more entities than expected."));
         }
         match linux::ioctl_raw(fd, MEDIA_IOC_ENUM_ENTITIES, &mut desc) {
@@ -107,6 +104,11 @@ pub fn read_graph(path: &Path) -> Result<Graph> {
         let device = devnode(desc.major, desc.minor);
         let pads = desc.pads;
         let links = desc.links;
+        if pads > MAX_PADS || links > MAX_LINKS {
+            return Err(err(format!(
+                "Entity {id} reported {pads} pads and {links} links."
+            )));
+        }
         entities.push((id, name, device, pads, links));
         desc.id |= MEDIA_ENT_ID_FLAG_NEXT;
     }
@@ -132,8 +134,16 @@ pub fn read_graph(path: &Path) -> Result<Graph> {
         let mut request = MediaLinksEnum {
             entity: *id,
             _pad: 0,
-            pads: pad_buf.as_mut_ptr(),
-            links: link_buf.as_mut_ptr(),
+            pads: if pad_buf.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                pad_buf.as_mut_ptr()
+            },
+            links: if link_buf.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                link_buf.as_mut_ptr()
+            },
             reserved: [0; 4],
         };
         ioctl(
@@ -186,21 +196,25 @@ fn devnode(major: u32, minor: u32) -> Option<String> {
     if major == 0 {
         return None;
     }
-    let text = std::fs::read_to_string(format!("/sys/dev/char/{major}:{minor}/uevent")).ok()?;
+    let path = format!("/sys/dev/char/{major}:{minor}/uevent");
+    let file = std::fs::File::open(path).ok()?;
+    let mut text = String::new();
+    std::io::Read::take(file, 4096)
+        .read_to_string(&mut text)
+        .ok()?;
     for line in text.lines() {
         if let Some(name) = line.strip_prefix("DEVNAME=") {
-            if name.starts_with('/') {
-                return Some(name.to_string());
-            }
-            return Some(format!("/dev/{name}"));
+            return crate::nodes::devname_path(name);
         }
     }
     None
 }
 
 pub fn set_edid(node: &Path, bytes: &mut [u8]) -> Result<()> {
-    if !bytes.len().is_multiple_of(128) {
-        return Err(err("EDID length is not a multiple of 128"));
+    if !bytes.len().is_multiple_of(128) || bytes.is_empty() || bytes.len() > 512 {
+        return Err(err(
+            "EDID length must be a multiple of 128, up to 512 bytes",
+        ));
     }
     let opened = Opened::rw(node)?;
     let mut request = V4l2Edid {
@@ -299,14 +313,16 @@ fn setup_link(opened: &Opened, link: &Link, flags: u32) -> Result<()> {
     let mut desc = MediaLinkDesc {
         source: MediaPadDesc {
             entity: link.from_id,
-            index: link.from_pad as u16,
+            index: u16::try_from(link.from_pad)
+                .map_err(|_| err("The source pad does not fit in 16 bits."))?,
             _pad: 0,
             flags: 0,
             reserved: [0; 2],
         },
         sink: MediaPadDesc {
             entity: link.to_id,
-            index: link.to_pad as u16,
+            index: u16::try_from(link.to_pad)
+                .map_err(|_| err("The sink pad does not fit in 16 bits."))?,
             _pad: 0,
             flags: 0,
             reserved: [0; 2],
@@ -496,7 +512,7 @@ pub fn capture_frames(node: &Path, output: &Path, skip: u32, count: u32) -> Resu
     request.type_ = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     request.memory = V4L2_MEMORY_MMAP;
     ioctl(fd, VIDIOC_REQBUFS, &mut request, "request capture buffers")?;
-    if request.count < 2 {
+    if request.count < 2 || request.count > MAX_CAPTURE_BUFFERS {
         return Err(err(format!(
             "The driver offered {} capture buffers.",
             request.count
@@ -516,6 +532,9 @@ pub fn capture_frames(node: &Path, output: &Path, skip: u32, count: u32) -> Resu
         buffer.memory = V4L2_MEMORY_MMAP;
         ioctl(fd, VIDIOC_QUERYBUF, &mut buffer, "query capture buffer")?;
         let length = buffer.length as usize;
+        if length == 0 || length > MAX_CAPTURE_BYTES {
+            return Err(err(format!("Capture buffer {index} is {length} bytes.")));
+        }
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -538,8 +557,7 @@ pub fn capture_frames(node: &Path, output: &Path, skip: u32, count: u32) -> Resu
 
     ioctl(fd, VIDIOC_STREAMON, &mut session.buf_type, "start capture")?;
     session.streaming = true;
-    let mut file = File::create(output)
-        .map_err(|error| err(format!("Cannot create {}: {error}", output.display())))?;
+    let mut file = crate::nodes::create_output(output)?;
     let mut written = 0u64;
     let mut kept = 0u32;
     let mut seen = 0u32;
@@ -550,17 +568,19 @@ pub fn capture_frames(node: &Path, output: &Path, skip: u32, count: u32) -> Resu
         buffer.memory = V4L2_MEMORY_MMAP;
         ioctl(fd, VIDIOC_DQBUF, &mut buffer, "dequeue capture buffer")?;
         let index = buffer.index as usize;
+        let Some((ptr, len)) = session.maps.get(index) else {
+            return Err(err(format!(
+                "The driver returned capture buffer {index}, which was not queued."
+            )));
+        };
         let used = if buffer.bytesused == 0 {
-            session.maps.get(index).map(|(_, len)| *len).unwrap_or(0)
+            *len
         } else {
-            buffer.bytesused as usize
+            (buffer.bytesused as usize).min(*len)
         };
         if seen >= skip {
-            if let Some((ptr, len)) = session.maps.get(index) {
-                let take = used.min(*len);
-                let slice = unsafe { std::slice::from_raw_parts(*ptr as *const u8, take) };
-                std::io::Write::write_all(&mut file, slice)?;
-            }
+            let slice = unsafe { std::slice::from_raw_parts(*ptr as *const u8, used) };
+            std::io::Write::write_all(&mut file, slice)?;
             written += used as u64;
             kept += 1;
         }

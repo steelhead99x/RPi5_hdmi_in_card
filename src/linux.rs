@@ -3,7 +3,7 @@
 //! Sizes were checked against the kernel headers with both the host compiler
 //! and `aarch64-linux-gnu-gcc`. The two targets agreed.
 
-use std::mem::{size_of, MaybeUninit};
+use std::mem::MaybeUninit;
 
 pub const MEDIA_ENT_ID_FLAG_NEXT: u32 = 1 << 31;
 pub const MEDIA_LNK_FL_ENABLED: u32 = 1;
@@ -144,21 +144,45 @@ pub struct V4l2Format {
     pub _tail: u32,
 }
 
+fn put_u32(raw: &mut [u8], offset: usize, value: u32) {
+    raw[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
+}
+
+fn get_u32(raw: &[u8], offset: usize) -> u32 {
+    u32::from_ne_bytes(raw[offset..offset + 4].try_into().expect("4 bytes"))
+}
+
 impl V4l2Format {
     pub fn pix(&self) -> PixFormat {
-        let mut bytes = [0u8; 48];
-        bytes.copy_from_slice(&self.raw[..48]);
-        unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const PixFormat) }
+        PixFormat {
+            width: get_u32(&self.raw, 0),
+            height: get_u32(&self.raw, 4),
+            pixelformat: get_u32(&self.raw, 8),
+            field: get_u32(&self.raw, 12),
+            bytesperline: get_u32(&self.raw, 16),
+            sizeimage: get_u32(&self.raw, 20),
+            colorspace: get_u32(&self.raw, 24),
+            priv_: get_u32(&self.raw, 28),
+            flags: get_u32(&self.raw, 32),
+            ycbcr_enc: get_u32(&self.raw, 36),
+            quantization: get_u32(&self.raw, 40),
+            xfer_func: get_u32(&self.raw, 44),
+        }
     }
 
     pub fn set_pix(&mut self, pix: &PixFormat) {
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                (pix as *const PixFormat) as *const u8,
-                size_of::<PixFormat>(),
-            )
-        };
-        self.raw[..bytes.len()].copy_from_slice(bytes);
+        put_u32(&mut self.raw, 0, pix.width);
+        put_u32(&mut self.raw, 4, pix.height);
+        put_u32(&mut self.raw, 8, pix.pixelformat);
+        put_u32(&mut self.raw, 12, pix.field);
+        put_u32(&mut self.raw, 16, pix.bytesperline);
+        put_u32(&mut self.raw, 20, pix.sizeimage);
+        put_u32(&mut self.raw, 24, pix.colorspace);
+        put_u32(&mut self.raw, 28, pix.priv_);
+        put_u32(&mut self.raw, 32, pix.flags);
+        put_u32(&mut self.raw, 36, pix.ycbcr_enc);
+        put_u32(&mut self.raw, 40, pix.quantization);
+        put_u32(&mut self.raw, 44, pix.xfer_func);
     }
 }
 
@@ -283,6 +307,7 @@ pub fn ioctl<T>(fd: i32, request: u32, arg: *mut T, what: &str) -> crate::error:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::mem::size_of;
 
     #[test]
     fn struct_sizes_match_kernel_headers() {

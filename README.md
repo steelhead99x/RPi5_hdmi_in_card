@@ -133,7 +133,7 @@ Each file has one preferred timing, an HDMI audio block, and stereo speakers. Th
 
 The command prints the media device, the bridge subdevice, and the video node it chose. Those numbers change from boot to boot. Later capture commands should use the video node from that output.
 
-`--no-test` configures the pipeline and does not capture frames. `--dry-run` prints the planned changes and does not change the device. `--media /dev/mediaN` picks one media device when more than one bridge is present. `--help` lists the flags.
+`--no-test` configures the pipeline and does not capture frames. `--dry-run` prints the planned changes and does not change the device. `--media` takes a `/dev/mediaN` node. A symlink is accepted only when it points at another node under `/dev`. `--help` lists the flags.
 
 ```
 ./hdmi-in --help
