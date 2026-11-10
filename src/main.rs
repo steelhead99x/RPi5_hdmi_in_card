@@ -3,6 +3,7 @@ mod edid;
 mod error;
 mod graph;
 mod linux;
+mod nodes;
 mod run;
 
 use std::path::PathBuf;

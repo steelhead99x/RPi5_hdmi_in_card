@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::error::{err, Result};
@@ -29,11 +30,12 @@ pub fn nominal_size(name: &str) -> Option<(u32, u32)> {
     }
 }
 
+const MAX_EDID_FILE: u64 = 16 * 1024;
+
 pub fn load(name: &str) -> Result<Edid> {
     let path = Path::new(name);
     if name.contains('/') || path.is_file() {
-        let bytes =
-            std::fs::read(path).map_err(|error| err(format!("Cannot read {name}: {error}")))?;
+        let bytes = read_edid_file(path)?;
         let parsed = parse_bytes(&bytes).map_err(|error| err(format!("{name}: {error}")))?;
         return Ok(Edid {
             name: path
@@ -63,6 +65,36 @@ pub fn load(name: &str) -> Result<Edid> {
     )))
 }
 
+fn read_edid_file(path: &Path) -> Result<Vec<u8>> {
+    let followed = std::fs::metadata(path)
+        .map_err(|error| err(format!("Cannot read {}: {error}", path.display())))?;
+    if !followed.is_file() {
+        return Err(err(format!("{} is not a regular file.", path.display())));
+    }
+    if followed.len() > MAX_EDID_FILE {
+        return Err(err(format!(
+            "{} is {} bytes. An EDID file must be {} bytes or smaller.",
+            path.display(),
+            followed.len(),
+            MAX_EDID_FILE
+        )));
+    }
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| err(format!("Cannot read {}: {error}", path.display())))?;
+    let mut bytes = Vec::new();
+    std::io::Read::take(&mut file, MAX_EDID_FILE + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| err(format!("Cannot read {}: {error}", path.display())))?;
+    if bytes.len() as u64 > MAX_EDID_FILE {
+        return Err(err(format!(
+            "{} is larger than {} bytes.",
+            path.display(),
+            MAX_EDID_FILE
+        )));
+    }
+    Ok(bytes)
+}
+
 fn path_label(path: &Path) -> String {
     std::fs::canonicalize(path)
         .unwrap_or_else(|_| PathBuf::from(path))
@@ -71,6 +103,9 @@ fn path_label(path: &Path) -> String {
 }
 
 pub fn parse_hex(text: &str) -> Result<Vec<u8>> {
+    if text.len() > MAX_EDID_FILE as usize {
+        return Err(err("EDID text is too long."));
+    }
     let mut digits = String::new();
     let mut chars = text.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -202,6 +237,17 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("header"));
+    }
+
+    #[test]
+    fn rejects_oversized_text_and_non_files() {
+        let text = "00".repeat(20_000);
+        assert!(parse_hex(&text)
+            .unwrap_err()
+            .to_string()
+            .contains("too long"));
+        let error = load("/dev/null").unwrap_err().to_string();
+        assert!(error.contains("regular file"), "{error}");
     }
 
     #[test]
