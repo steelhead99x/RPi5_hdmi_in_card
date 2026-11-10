@@ -235,6 +235,15 @@ if run_script --not-an-option; then
 fi
 assert_eq "$status" "1" "unknown option exit"
 
+echo "test: a media symlink outside the scan directory is refused"
+ln -s /etc/passwd "$WORK/dev/media9"
+if run_script --media "$WORK/dev/media9" --no-test; then
+  fail "a symlink out of the media directory should fail"
+fi
+assert_eq "$status" "1" "escaped symlink exit"
+grep -F -- "points outside" "$WORK/err" >/dev/null || fail "escaped symlink message missing"
+rm -f "$WORK/dev/media9"
+
 echo "test: help"
 help_text=$(bash "$SCRIPT" --help)
 grep -F -- "--no-test" <<<"$help_text" >/dev/null || fail "help does not mention --no-test"
