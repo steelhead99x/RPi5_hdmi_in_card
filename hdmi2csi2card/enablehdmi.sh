@@ -24,6 +24,9 @@ WIDTH_OVERRIDE=""
 HEIGHT_OVERRIDE=""
 OUTPUT=csitest.yuv
 MEDIA_DIR=${MEDIA_DIR:-/dev}
+if [[ "$MEDIA_DIR" != "/" ]]; then
+  MEDIA_DIR=${MEDIA_DIR%/}
+fi
 MEDIA_NODE=""
 SLEEP_SECONDS=${SLEEP_SECONDS:-5}
 
@@ -102,6 +105,51 @@ resolve_edid() {
   if [[ "$EDID_PATH" == *,* ]]; then
     die "The EDID path cannot contain a comma. v4l2-ctl splits --set-edid on commas."
   fi
+  case "$EDID_PATH" in
+    *$'\n'* | *$'\r'*)
+      die "The EDID path cannot contain a newline."
+      ;;
+  esac
+}
+
+# Keep a selected node inside root. A symlink is allowed only when its target
+# stays inside that same directory, so a link cannot point at another file tree.
+node_inside() {
+  local path=$1 root=$2 target
+  case "$path" in
+    "$root" | "$root"/*) ;;
+    *) die "Refusing ${path}. It is outside ${root}." ;;
+  esac
+  case "$path" in
+    *"/../"* | ../* | */..) die "Refusing ${path}." ;;
+  esac
+  if [[ -L "$path" ]]; then
+    target=$(readlink -f -- "$path") || die "Cannot resolve ${path}."
+    case "$target" in
+      "$root"/*) ;;
+      *) die "Refusing ${path} because it points outside ${root}." ;;
+    esac
+  fi
+}
+
+require_v4l_node() {
+  local path=$1
+  [[ "$path" =~ ^/dev/(video|v4l-subdev)[0-9]+$ ]] || die "Refusing device path: ${path}"
+}
+
+require_entity_name() {
+  local name=$1
+  [[ "$name" =~ ^[A-Za-z0-9._:-]+([[:space:]][A-Za-z0-9._:-]+)*$ ]] || die "Refusing device name: ${name}"
+}
+
+require_output_path() {
+  if [[ -L "$OUTPUT" ]]; then
+    die "Refusing to write the frame test through a symlink."
+  fi
+  case "$OUTPUT" in
+    /dev/null) ;;
+    /dev/*) die "Refusing to write the frame test to a device node." ;;
+  esac
 }
 
 parse_args() {
@@ -280,6 +328,10 @@ parse_media_graph() {
   CSI_PAD=${link_pad[$chosen]}
   VIDEO_ENTITY=${link_to[$chosen]}
   VIDEO_DEV=${NODE_OF[$VIDEO_ENTITY]}
+  [[ "$CSI_PAD" =~ ^[0-9]+$ ]] || {
+    PARSE_ERROR="The CSI-2 pad is not a number."
+    return 1
+  }
   return 0
 }
 
@@ -307,6 +359,7 @@ find_bridge() {
     if [[ ! -e "$node" ]]; then
       continue
     fi
+    node_inside "$node" "$MEDIA_DIR"
     if graph=$(media-ctl -d "$node" -p 2>/dev/null); then
       if [[ "$graph" == *"tc358743"* ]]; then
         found+=("$node")
@@ -357,11 +410,16 @@ main() {
   command -v v4l2-ctl >/dev/null 2>&1 || die "v4l2-ctl is not installed. Install the v4l-utils package."
   resolve_edid "$EDID_NAME"
   nominal_size "$EDID_PATH"
+  require_output_path
   find_bridge
   if ! parse_media_graph "$MEDIA_GRAPH"; then
     list_entities
     die "$PARSE_ERROR"
   fi
+  require_v4l_node "$BRIDGE_DEV"
+  require_v4l_node "$VIDEO_DEV"
+  require_entity_name "$BRIDGE_ENTITY"
+  require_entity_name "$VIDEO_ENTITY"
 
   echo "Media device: ${MEDIA_DEV}"
   echo "Bridge: ${BRIDGE_ENTITY} (${BRIDGE_DEV})"
