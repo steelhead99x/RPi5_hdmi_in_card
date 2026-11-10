@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# The Rust hdmi-in command is the new setup path. This script remains as the
+# earlier shell implementation.
 # Load a TC358743 EDID on a Raspberry Pi 5 and point the CSI-2 pipeline at it.
 # Device numbers change from boot to boot, so this script reads the media graph
 # instead of assuming /dev/video0 or /dev/v4l-subdev2.
