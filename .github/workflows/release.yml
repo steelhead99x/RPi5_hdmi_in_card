@@ -1,0 +1,58 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: stable
+          targets: aarch64-unknown-linux-gnu
+      - name: Install the aarch64 linker
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Build the aarch64 binary
+        run: cargo build --release --target aarch64-unknown-linux-gnu
+      - name: Write the checksum
+        run: |
+          cp target/aarch64-unknown-linux-gnu/release/hdmi-in hdmi-in
+          sha256sum hdmi-in > hdmi-in.sha256
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<'EOF'
+          This build has not been tested on hardware yet.
+
+          Copy `hdmi-in` to the Pi, then:
+
+          ```
+          chmod +x hdmi-in
+          sha256sum -c hdmi-in.sha256
+          ./hdmi-in status
+          echo "status exit: $?"
+          ./hdmi-in --dry-run --edid 1080p60edid
+          echo "dry-run exit: $?"
+          ./hdmi-in --edid 720p60edid
+          echo "720p60 exit: $?"
+          ./hdmi-in --edid 1080p30edid
+          echo "1080p30 exit: $?"
+          ./hdmi-in --edid 1080p60edid
+          echo "1080p60 exit: $?"
+          ./hdmi-in status
+          echo "status exit: $?"
+          ```
+
+          Paste the full output, including both status reports and the exit lines.
+          EOF
+          gh release create "$GITHUB_REF_NAME" hdmi-in hdmi-in.sha256 \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file notes.md
