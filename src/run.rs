@@ -100,7 +100,12 @@ pub fn setup(options: &SetupOptions) -> Result<i32> {
             "Would set RGB888_1X24 {width}x{height} on {}, {} pad 0, and {} pad {}.",
             route.bridge_dev, route.csi_dev, route.csi_dev, route.source_pad
         );
-        println!("Would set RGB3 {width}x{height} on {}.", route.video_dev);
+        let io = device::video_io(Path::new(&route.video_dev))?;
+        println!(
+            "Would set RGB3 {width}x{height} on {} ({}).",
+            route.video_dev,
+            io.label()
+        );
         if have_signal && options.test {
             println!("Would capture 2 frames to {}.", options.output.display());
         }
@@ -116,13 +121,20 @@ pub fn setup(options: &SetupOptions) -> Result<i32> {
         device::set_subdev_format(Path::new(&route.csi_dev), 0, width, height)?;
         device::set_subdev_format(Path::new(&route.csi_dev), route.source_pad, width, height)?;
         let programmed = device::set_video_format(Path::new(&route.video_dev), width, height)?;
+        println!("Video format: {}", programmed.summary());
+        if !programmed.is_packed_rgb() {
+            return Err(err(format!(
+                "The video node accepted {}. This command captures one plane of RGB3 or BGR3.",
+                programmed.summary()
+            )));
+        }
         if programmed.pixelformat != crate::linux::V4L2_PIX_FMT_RGB24
             || programmed.width != width
             || programmed.height != height
         {
             eprintln!(
-                "hdmi-in: the video node accepted {}x{} fourcc 0x{:08x}.",
-                programmed.width, programmed.height, programmed.pixelformat
+                "hdmi-in: requested RGB3 {width}x{height}. The video node accepted {}.",
+                programmed.summary()
             );
         }
     }
@@ -140,14 +152,20 @@ pub fn setup(options: &SetupOptions) -> Result<i32> {
     if !options.test || options.dry_run {
         return Ok(0);
     }
-    let bytes = device::capture_frames(Path::new(&route.video_dev), &options.output, 3, 2)?;
-    if options.output != Path::new("/dev/null") && bytes == 0 {
+    let captured = device::capture_frames(Path::new(&route.video_dev), &options.output, 3, 2)?;
+    if options.output != Path::new("/dev/null") && captured.bytes == 0 {
         return Err(err(format!(
             "The frame test wrote no data to {}.",
             options.output.display()
         )));
     }
-    println!("Wrote {bytes} bytes to {}.", options.output.display());
+    println!(
+        "Wrote {} bytes to {} ({} packed frames, {}).",
+        captured.bytes,
+        options.output.display(),
+        captured.frames,
+        captured.picture.summary()
+    );
     Ok(0)
 }
 
@@ -185,8 +203,14 @@ pub fn status(media: Option<&Path>, media_dir: &Path) -> Result<i32> {
     print_bus("csi_source_format", &route.csi_dev, route.source_pad);
     match device::get_video_format(Path::new(&route.video_dev)) {
         Ok(pix) => println!(
-            "video_format: {}x{} fourcc=0x{:08x} bytesperline={} sizeimage={}",
-            pix.width, pix.height, pix.pixelformat, pix.bytesperline, pix.sizeimage
+            "video_format: {}x{} fourcc={} bytesperline={} sizeimage={} planes={} io={}",
+            pix.width,
+            pix.height,
+            crate::linux::fourcc_label(pix.pixelformat),
+            pix.bytesperline,
+            pix.sizeimage,
+            pix.planes,
+            pix.io.label()
         ),
         Err(error) => println!("video_format: unavailable ({error})"),
     }

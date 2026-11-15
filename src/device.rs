@@ -3,18 +3,20 @@ use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use crate::error::{err, Result};
+use crate::frame;
 use crate::graph::{Entity, Graph, Link};
 use crate::linux::{
     self, c_string, ioctl, zeroed, BtTimings, Capability, DvTimings, MediaEntityDesc,
-    MediaLinkDesc, MediaLinksEnum, MediaPadDesc, RequestBuffers, SubdevFormat, V4l2Buffer,
-    V4l2Edid, V4l2Format, MEDIA_BUS_FMT_RGB888_1X24, MEDIA_ENT_ID_FLAG_NEXT,
-    MEDIA_IOC_ENUM_ENTITIES, MEDIA_IOC_ENUM_LINKS, MEDIA_IOC_SETUP_LINK, MEDIA_LNK_FL_ENABLED,
-    MEDIA_LNK_FL_IMMUTABLE, MEDIA_LNK_FL_LINK_TYPE, V4L2_BUF_TYPE_VIDEO_CAPTURE,
-    V4L2_CAP_DEVICE_CAPS, V4L2_COLORSPACE_SRGB, V4L2_FIELD_NONE, V4L2_MEMORY_MMAP,
-    V4L2_PIX_FMT_RGB24, V4L2_SUBDEV_FORMAT_ACTIVE, VIDIOC_DQBUF, VIDIOC_G_FMT, VIDIOC_QBUF,
-    VIDIOC_QUERYBUF, VIDIOC_QUERYCAP, VIDIOC_QUERY_DV_TIMINGS, VIDIOC_REQBUFS, VIDIOC_STREAMOFF,
-    VIDIOC_STREAMON, VIDIOC_SUBDEV_G_FMT, VIDIOC_SUBDEV_S_FMT, VIDIOC_S_DV_TIMINGS, VIDIOC_S_EDID,
-    VIDIOC_S_FMT,
+    MediaLinkDesc, MediaLinksEnum, MediaPadDesc, MplaneFormat, PixFormat, RequestBuffers,
+    SubdevFormat, V4l2Buffer, V4l2Edid, V4l2Format, V4l2Plane, MEDIA_BUS_FMT_RGB888_1X24,
+    MEDIA_ENT_ID_FLAG_NEXT, MEDIA_IOC_ENUM_ENTITIES, MEDIA_IOC_ENUM_LINKS, MEDIA_IOC_SETUP_LINK,
+    MEDIA_LNK_FL_ENABLED, MEDIA_LNK_FL_IMMUTABLE, MEDIA_LNK_FL_LINK_TYPE,
+    V4L2_BUF_TYPE_VIDEO_CAPTURE, V4L2_CAP_DEVICE_CAPS, V4L2_CAP_META_CAPTURE,
+    V4L2_CAP_VIDEO_CAPTURE, V4L2_CAP_VIDEO_CAPTURE_MPLANE, V4L2_COLORSPACE_SRGB, V4L2_FIELD_NONE,
+    V4L2_MEMORY_MMAP, V4L2_PIX_FMT_BGR24, V4L2_PIX_FMT_RGB24, V4L2_SUBDEV_FORMAT_ACTIVE,
+    VIDIOC_DQBUF, VIDIOC_G_FMT, VIDIOC_QBUF, VIDIOC_QUERYBUF, VIDIOC_QUERYCAP,
+    VIDIOC_QUERY_DV_TIMINGS, VIDIOC_REQBUFS, VIDIOC_STREAMOFF, VIDIOC_STREAMON,
+    VIDIOC_SUBDEV_G_FMT, VIDIOC_SUBDEV_S_FMT, VIDIOC_S_DV_TIMINGS, VIDIOC_S_EDID, VIDIOC_S_FMT,
 };
 
 const MAX_ENTITIES: usize = 256;
@@ -395,11 +397,160 @@ pub fn format_bus(format: &SubdevFormat) -> String {
     )
 }
 
-pub fn set_video_format(node: &Path, width: u32, height: u32) -> Result<linux::PixFormat> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureIo {
+    Single,
+    Multiplanar,
+}
+
+impl CaptureIo {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Single => "single-planar",
+            Self::Multiplanar => "multiplanar",
+        }
+    }
+
+    pub fn buf_type(self) -> u32 {
+        match self {
+            Self::Single => V4L2_BUF_TYPE_VIDEO_CAPTURE,
+            Self::Multiplanar => linux::V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE,
+        }
+    }
+
+    pub fn from_bits(bits: u32) -> Result<Self> {
+        if bits & V4L2_CAP_VIDEO_CAPTURE_MPLANE != 0 {
+            Ok(Self::Multiplanar)
+        } else if bits & V4L2_CAP_VIDEO_CAPTURE != 0 {
+            Ok(Self::Single)
+        } else {
+            Err(err(format!(
+                "The video node does not support video capture (caps=0x{bits:08x})."
+            )))
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VideoPicture {
+    pub width: u32,
+    pub height: u32,
+    pub pixelformat: u32,
+    pub bytesperline: u32,
+    pub sizeimage: u32,
+    pub planes: u32,
+    pub io: CaptureIo,
+}
+
+impl VideoPicture {
+    pub fn is_packed_rgb(&self) -> bool {
+        self.planes == 1
+            && (self.pixelformat == V4L2_PIX_FMT_RGB24 || self.pixelformat == V4L2_PIX_FMT_BGR24)
+    }
+
+    pub fn summary(&self) -> String {
+        let fourcc = linux::fourcc_label(self.pixelformat);
+        if self.planes == 1 {
+            format!(
+                "{fourcc} {}x{} stride {} {}",
+                self.width,
+                self.height,
+                self.bytesperline,
+                self.io.label()
+            )
+        } else {
+            format!(
+                "{fourcc} {}x{} stride {} {} planes {}",
+                self.width,
+                self.height,
+                self.bytesperline,
+                self.planes,
+                self.io.label()
+            )
+        }
+    }
+}
+
+pub struct CapturedFrames {
+    pub bytes: u64,
+    pub frames: u32,
+    pub picture: VideoPicture,
+}
+
+fn capability_bits(caps: &Capability) -> u32 {
+    if caps.capabilities & V4L2_CAP_DEVICE_CAPS != 0 {
+        caps.device_caps
+    } else {
+        caps.capabilities
+    }
+}
+
+fn read_capability(fd: i32, node: &Path) -> Result<Capability> {
+    let mut caps: Capability = zeroed();
+    ioctl(
+        fd,
+        VIDIOC_QUERYCAP,
+        &mut caps,
+        &format!("query capabilities of {}", node.display()),
+    )?;
+    Ok(caps)
+}
+
+fn video_io_from(opened: &Opened, node: &Path) -> Result<CaptureIo> {
+    let caps = read_capability(opened.fd(), node)?;
+    CaptureIo::from_bits(capability_bits(&caps))
+        .map_err(|error| err(format!("{}: {error}", node.display())))
+}
+
+pub fn video_io(node: &Path) -> Result<CaptureIo> {
     let opened = Opened::rw(node)?;
+    video_io_from(&opened, node)
+}
+
+fn picture_from_format(io: CaptureIo, format: &V4l2Format) -> VideoPicture {
+    match io {
+        CaptureIo::Single => {
+            let pix = format.pix();
+            VideoPicture {
+                width: pix.width,
+                height: pix.height,
+                pixelformat: pix.pixelformat,
+                bytesperline: pix.bytesperline,
+                sizeimage: pix.sizeimage,
+                planes: 1,
+                io,
+            }
+        }
+        CaptureIo::Multiplanar => {
+            let pix = format.mplane();
+            VideoPicture {
+                width: pix.width,
+                height: pix.height,
+                pixelformat: pix.pixelformat,
+                bytesperline: pix.bytesperline,
+                sizeimage: pix.sizeimage,
+                planes: u32::from(pix.num_planes),
+                io,
+            }
+        }
+    }
+}
+
+fn read_picture(opened: &Opened, node: &Path) -> Result<VideoPicture> {
+    let io = video_io_from(opened, node)?;
     let mut format: V4l2Format = zeroed();
-    format.type_ = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    let pix = linux::PixFormat {
+    format.type_ = io.buf_type();
+    ioctl(
+        opened.fd(),
+        VIDIOC_G_FMT,
+        &mut format,
+        &format!("read video format on {} ({})", node.display(), io.label()),
+    )?;
+    Ok(picture_from_format(io, &format))
+}
+
+fn single_rgb(width: u32, height: u32) -> PixFormat {
+    PixFormat {
         width,
         height,
         pixelformat: V4L2_PIX_FMT_RGB24,
@@ -412,73 +563,85 @@ pub fn set_video_format(node: &Path, width: u32, height: u32) -> Result<linux::P
         ycbcr_enc: 0,
         quantization: 0,
         xfer_func: 0,
-    };
-    format.set_pix(&pix);
+    }
+}
+
+fn multi_rgb(width: u32, height: u32) -> MplaneFormat {
+    MplaneFormat {
+        width,
+        height,
+        pixelformat: V4L2_PIX_FMT_RGB24,
+        field: V4L2_FIELD_NONE,
+        colorspace: V4L2_COLORSPACE_SRGB,
+        bytesperline: 0,
+        sizeimage: 0,
+        num_planes: 1,
+        flags: 0,
+        ycbcr_enc: 0,
+        quantization: 0,
+        xfer_func: 0,
+    }
+}
+
+pub fn set_video_format(node: &Path, width: u32, height: u32) -> Result<VideoPicture> {
+    let opened = Opened::rw(node)?;
+    let io = video_io_from(&opened, node)?;
+    let mut format: V4l2Format = zeroed();
+    format.type_ = io.buf_type();
+    match io {
+        CaptureIo::Single => format.set_pix(&single_rgb(width, height)),
+        CaptureIo::Multiplanar => format.set_mplane(&multi_rgb(width, height)),
+    }
     ioctl(
         opened.fd(),
         VIDIOC_S_FMT,
         &mut format,
-        &format!("set video format on {}", node.display()),
+        &format!("set video format on {} ({})", node.display(), io.label()),
     )?;
-    Ok(format.pix())
+    Ok(picture_from_format(io, &format))
 }
 
-pub fn get_video_format(node: &Path) -> Result<linux::PixFormat> {
+pub fn get_video_format(node: &Path) -> Result<VideoPicture> {
     let opened = Opened::rw(node)?;
-    let mut format: V4l2Format = zeroed();
-    format.type_ = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    ioctl(
-        opened.fd(),
-        VIDIOC_G_FMT,
-        &mut format,
-        &format!("read video format on {}", node.display()),
-    )?;
-    Ok(format.pix())
+    read_picture(&opened, node)
 }
 
-pub fn query_caps(node: &Path) -> Result<String> {
-    let opened = Opened::rw(node)?;
-    let mut caps: Capability = zeroed();
-    ioctl(
-        opened.fd(),
-        VIDIOC_QUERYCAP,
-        &mut caps,
-        &format!("query capabilities of {}", node.display()),
-    )?;
-    let bits = if caps.capabilities & V4L2_CAP_DEVICE_CAPS != 0 {
-        caps.device_caps
-    } else {
-        caps.capabilities
-    };
+fn capability_names(bits: u32) -> String {
     let mut names = Vec::new();
-    if bits & linux::V4L2_CAP_VIDEO_CAPTURE != 0 {
+    if bits & V4L2_CAP_VIDEO_CAPTURE != 0 {
         names.push("capture");
     }
-    if bits & linux::V4L2_CAP_VIDEO_CAPTURE_MPLANE != 0 {
+    if bits & V4L2_CAP_VIDEO_CAPTURE_MPLANE != 0 {
         names.push("capture-mplane");
+    }
+    if bits & V4L2_CAP_META_CAPTURE != 0 {
+        names.push("meta");
     }
     if names.is_empty() {
         names.push("other");
     }
-    Ok(format!("{} caps=0x{bits:08x}", names.join(",")))
+    names.join(",")
+}
+
+pub fn query_caps(node: &Path) -> Result<String> {
+    let opened = Opened::rw(node)?;
+    let caps = read_capability(opened.fd(), node)?;
+    let bits = capability_bits(&caps);
+    Ok(format!("{} caps=0x{bits:08x}", capability_names(bits)))
 }
 
 struct CaptureSession {
     fd: i32,
     maps: Vec<(*mut libc::c_void, usize)>,
     streaming: bool,
-    buf_type: libc::c_int,
+    buf_type: u32,
 }
 
 impl Drop for CaptureSession {
     fn drop(&mut self) {
         if self.streaming {
-            let _ = ioctl(
-                self.fd,
-                VIDIOC_STREAMOFF,
-                &mut self.buf_type,
-                "stop capture",
-            );
+            let mut buf_type = self.buf_type as libc::c_int;
+            let _ = ioctl(self.fd, VIDIOC_STREAMOFF, &mut buf_type, "stop capture");
         }
         for (ptr, len) in self.maps.drain(..) {
             unsafe {
@@ -487,7 +650,7 @@ impl Drop for CaptureSession {
         }
         let mut release: RequestBuffers = zeroed();
         release.count = 0;
-        release.type_ = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        release.type_ = self.buf_type;
         release.memory = V4L2_MEMORY_MMAP;
         let _ = ioctl(
             self.fd,
@@ -498,18 +661,27 @@ impl Drop for CaptureSession {
     }
 }
 
-pub fn capture_frames(node: &Path, output: &Path, skip: u32, count: u32) -> Result<u64> {
+pub fn capture_frames(node: &Path, output: &Path, skip: u32, count: u32) -> Result<CapturedFrames> {
     let opened = Opened::rw(node)?;
     let fd = opened.fd();
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags >= 0 {
-        unsafe {
-            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-        }
+    let picture = read_picture(&opened, node)?;
+    if !picture.is_packed_rgb() {
+        return Err(err(format!(
+            "The video node is {}. This command captures one plane of RGB3 or BGR3.",
+            picture.summary()
+        )));
     }
+    let layout = frame::rgb24_layout(picture.width, picture.height, picture.bytesperline)?;
+    if layout.packed > MAX_CAPTURE_BYTES {
+        return Err(err(format!(
+            "A packed frame is {} bytes, above the {MAX_CAPTURE_BYTES} byte capture limit.",
+            layout.packed
+        )));
+    }
+    set_nonblocking(fd);
     let mut request: RequestBuffers = zeroed();
     request.count = 4;
-    request.type_ = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    request.type_ = picture.io.buf_type();
     request.memory = V4L2_MEMORY_MMAP;
     ioctl(fd, VIDIOC_REQBUFS, &mut request, "request capture buffers")?;
     if request.count < 2 || request.count > MAX_CAPTURE_BUFFERS {
@@ -523,26 +695,120 @@ pub fn capture_frames(node: &Path, output: &Path, skip: u32, count: u32) -> Resu
         fd,
         maps: Vec::new(),
         streaming: false,
-        buf_type: V4L2_BUF_TYPE_VIDEO_CAPTURE as libc::c_int,
+        buf_type: picture.io.buf_type(),
     };
-    for index in 0..request.count {
+    let multi = picture.io == CaptureIo::Multiplanar;
+    map_and_queue(&mut session, request.count, multi)?;
+    let mut stream_type = session.buf_type as libc::c_int;
+    ioctl(fd, VIDIOC_STREAMON, &mut stream_type, "start capture")?;
+    session.streaming = true;
+    let mut file = crate::nodes::create_output(output)?;
+    let mut written = 0u64;
+    let mut kept = 0u32;
+    let mut seen = 0u32;
+    while kept < count {
+        wait_for_frame(fd)?;
+        let mut plane: V4l2Plane = zeroed();
         let mut buffer: V4l2Buffer = zeroed();
-        buffer.index = index;
-        buffer.type_ = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        buffer.memory = V4L2_MEMORY_MMAP;
+        prepare_buffer(&mut buffer, &mut plane, 0, session.buf_type, multi);
+        ioctl(fd, VIDIOC_DQBUF, &mut buffer, "dequeue capture buffer")?;
+        let index = usize::try_from(buffer.index).unwrap_or(usize::MAX);
+        let bytesused = if multi {
+            plane.bytesused
+        } else {
+            buffer.bytesused
+        };
+        let data_offset = if multi { plane.data_offset } else { 0 };
+        let Some((ptr, map_len)) = session.maps.get(index).copied() else {
+            return Err(err(format!(
+                "The driver returned capture buffer {index}, which was not queued."
+            )));
+        };
+        let used = if bytesused == 0 {
+            map_len
+        } else {
+            usize::try_from(bytesused).unwrap_or(map_len).min(map_len)
+        };
+        if seen >= skip {
+            // SAFETY: `ptr` is a live mapping of `map_len` bytes, and `used` is not larger.
+            let slice = unsafe { std::slice::from_raw_parts(ptr as *const u8, used) };
+            let packed = frame::pack_rgb24(slice, &layout, data_offset)?;
+            std::io::Write::write_all(&mut file, &packed)?;
+            written += packed.len() as u64;
+            kept += 1;
+        }
+        seen += 1;
+        // Requeue the same buffer. For a multiplanar node the plane array
+        // still has to be alive, which it is for the rest of this iteration.
+        ioctl(fd, VIDIOC_QBUF, &mut buffer, "requeue capture buffer")?;
+        if seen > skip + count + 20 {
+            return Err(err("The frame test stopped making progress."));
+        }
+    }
+    Ok(CapturedFrames {
+        bytes: written,
+        frames: kept,
+        picture,
+    })
+}
+
+fn set_nonblocking(fd: i32) {
+    // A failed flag change leaves the descriptor blocking. poll still works.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags >= 0 {
+        unsafe {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+}
+
+fn prepare_buffer(
+    buffer: &mut V4l2Buffer,
+    plane: &mut V4l2Plane,
+    index: u32,
+    buf_type: u32,
+    multi: bool,
+) {
+    buffer.index = index;
+    buffer.type_ = buf_type;
+    buffer.memory = V4L2_MEMORY_MMAP;
+    if multi {
+        // For a multiplanar queue, length is the plane count, not the byte size.
+        buffer.length = 1;
+        buffer.set_planes(plane);
+    }
+}
+
+fn map_and_queue(session: &mut CaptureSession, count: u32, multi: bool) -> Result<()> {
+    let fd = session.fd;
+    let buf_type = session.buf_type;
+    for index in 0..count {
+        let mut plane: V4l2Plane = zeroed();
+        let mut buffer: V4l2Buffer = zeroed();
+        prepare_buffer(&mut buffer, &mut plane, index, buf_type, multi);
         ioctl(fd, VIDIOC_QUERYBUF, &mut buffer, "query capture buffer")?;
-        let length = buffer.length as usize;
-        if length == 0 || length > MAX_CAPTURE_BYTES {
-            return Err(err(format!("Capture buffer {index} is {length} bytes.")));
+        let (map_len, map_off) = if multi {
+            (
+                usize::try_from(plane.length).unwrap_or(usize::MAX),
+                plane.mmap_offset(),
+            )
+        } else {
+            (
+                usize::try_from(buffer.length).unwrap_or(usize::MAX),
+                buffer.mmap_offset(),
+            )
+        };
+        if map_len == 0 || map_len > MAX_CAPTURE_BYTES {
+            return Err(err(format!("Capture buffer {index} is {map_len} bytes.")));
         }
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
-                length,
+                map_len,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_SHARED,
                 fd,
-                buffer.offset as libc::off_t,
+                map_off as libc::off_t,
             )
         };
         if ptr == libc::MAP_FAILED {
@@ -551,46 +817,13 @@ pub fn capture_frames(node: &Path, output: &Path, skip: u32, count: u32) -> Resu
                 std::io::Error::last_os_error()
             )));
         }
-        session.maps.push((ptr, length));
+        session.maps.push((ptr, map_len));
+        let mut plane: V4l2Plane = zeroed();
+        let mut buffer: V4l2Buffer = zeroed();
+        prepare_buffer(&mut buffer, &mut plane, index, buf_type, multi);
         ioctl(fd, VIDIOC_QBUF, &mut buffer, "queue capture buffer")?;
     }
-
-    ioctl(fd, VIDIOC_STREAMON, &mut session.buf_type, "start capture")?;
-    session.streaming = true;
-    let mut file = crate::nodes::create_output(output)?;
-    let mut written = 0u64;
-    let mut kept = 0u32;
-    let mut seen = 0u32;
-    while kept < count {
-        wait_for_frame(fd)?;
-        let mut buffer: V4l2Buffer = zeroed();
-        buffer.type_ = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        buffer.memory = V4L2_MEMORY_MMAP;
-        ioctl(fd, VIDIOC_DQBUF, &mut buffer, "dequeue capture buffer")?;
-        let index = buffer.index as usize;
-        let Some((ptr, len)) = session.maps.get(index) else {
-            return Err(err(format!(
-                "The driver returned capture buffer {index}, which was not queued."
-            )));
-        };
-        let used = if buffer.bytesused == 0 {
-            *len
-        } else {
-            (buffer.bytesused as usize).min(*len)
-        };
-        if seen >= skip {
-            let slice = unsafe { std::slice::from_raw_parts(*ptr as *const u8, used) };
-            std::io::Write::write_all(&mut file, slice)?;
-            written += used as u64;
-            kept += 1;
-        }
-        seen += 1;
-        ioctl(fd, VIDIOC_QBUF, &mut buffer, "requeue capture buffer")?;
-        if seen > skip + count + 20 {
-            return Err(err("The frame test stopped making progress."));
-        }
-    }
-    Ok(written)
+    Ok(())
 }
 
 fn wait_for_frame(fd: i32) -> Result<()> {
@@ -628,5 +861,94 @@ fn colorspace_name(colorspace: u32) -> &'static str {
         "srgb"
     } else {
         "other"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multiplanar_capability_wins_and_device_caps_are_per_node() {
+        assert_eq!(
+            CaptureIo::from_bits(V4L2_CAP_VIDEO_CAPTURE_MPLANE).unwrap(),
+            CaptureIo::Multiplanar
+        );
+        assert_eq!(
+            CaptureIo::from_bits(V4L2_CAP_VIDEO_CAPTURE).unwrap(),
+            CaptureIo::Single
+        );
+        assert_eq!(
+            CaptureIo::from_bits(V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_VIDEO_CAPTURE_MPLANE).unwrap(),
+            CaptureIo::Multiplanar
+        );
+        assert!(CaptureIo::from_bits(0)
+            .unwrap_err()
+            .to_string()
+            .contains("does not support"));
+
+        let mut caps: Capability = zeroed();
+        caps.capabilities =
+            V4L2_CAP_DEVICE_CAPS | V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_VIDEO_CAPTURE_MPLANE;
+        caps.device_caps = V4L2_CAP_VIDEO_CAPTURE_MPLANE;
+        assert_eq!(
+            CaptureIo::from_bits(capability_bits(&caps)).unwrap(),
+            CaptureIo::Multiplanar
+        );
+        caps.device_caps = V4L2_CAP_VIDEO_CAPTURE;
+        assert_eq!(
+            CaptureIo::from_bits(capability_bits(&caps)).unwrap(),
+            CaptureIo::Single
+        );
+        caps.device_caps = 0;
+        assert!(CaptureIo::from_bits(capability_bits(&caps)).is_err());
+
+        caps.capabilities = V4L2_CAP_VIDEO_CAPTURE;
+        caps.device_caps = V4L2_CAP_VIDEO_CAPTURE_MPLANE;
+        assert_eq!(
+            CaptureIo::from_bits(capability_bits(&caps)).unwrap(),
+            CaptureIo::Single
+        );
+    }
+
+    #[test]
+    fn packed_rgb_is_one_plane_of_rgb3_or_bgr3() {
+        let rgb = VideoPicture {
+            width: 1920,
+            height: 1080,
+            pixelformat: V4L2_PIX_FMT_RGB24,
+            bytesperline: 5760,
+            sizeimage: 6_220_800,
+            planes: 1,
+            io: CaptureIo::Multiplanar,
+        };
+        assert!(rgb.is_packed_rgb());
+        assert!(rgb.summary().contains("RGB3"));
+        assert!(rgb.summary().contains("multiplanar"));
+        let mut other = rgb;
+        other.pixelformat = u32::from_le_bytes(*b"YUYV");
+        assert!(!other.is_packed_rgb());
+        other = rgb;
+        other.planes = 2;
+        assert!(!other.is_packed_rgb());
+        assert!(other.summary().contains("2 planes"));
+        other = rgb;
+        other.pixelformat = V4L2_PIX_FMT_BGR24;
+        other.io = CaptureIo::Single;
+        assert!(other.is_packed_rgb());
+        assert!(other.summary().contains("single-planar"));
+    }
+
+    #[test]
+    fn image_node_caps_include_metadata() {
+        assert_eq!(
+            capability_names(V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_META_CAPTURE),
+            "capture,meta"
+        );
+        assert_eq!(
+            capability_names(V4L2_CAP_VIDEO_CAPTURE_MPLANE),
+            "capture-mplane"
+        );
+        assert_eq!(capability_names(0), "other");
     }
 }
