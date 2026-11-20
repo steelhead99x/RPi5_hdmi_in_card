@@ -1,6 +1,7 @@
 mod device;
 mod edid;
 mod error;
+mod frame;
 mod graph;
 mod linux;
 mod nodes;
@@ -22,7 +23,7 @@ use crate::run::SetupOptions;
     disable_help_subcommand = true
 )]
 struct Cli {
-    /// Print the bridge, video node, link, bus format, and signal lock.
+    /// Print the bridge, video node, formats, link, and signal lock.
     #[command(subcommand)]
     command: Option<Command>,
 
@@ -61,7 +62,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Print the bridge, video node, link, bus format, and signal lock.
+    /// Print the bridge, video node, formats, link, and signal lock.
     Status {
         /// Media device to read, such as /dev/media1.
         #[arg(long)]

@@ -113,6 +113,8 @@ Exit status 0 means the source reported timings and the requested steps finished
 
 `status` prints the media device, the bridge, the video node, the link pads, the bus format, the detected timings, and signal lock. Paste that block back as the hardware report.
 
+The Pi 5 image node is `rp1-cfe-csi2_ch0`. That node uses the single-planar video API, and it can also queue embedded data, so `video_caps` includes `capture,meta`. The frame test uses the image queue. `hdmi-in` reads the node capabilities and uses the multiplanar format and buffer ioctls only when the multiplanar bit is set. `status` records the choice as `io=single-planar` or `io=multiplanar` on the `video_format` line.
+
 The default EDID asks the source for 1920x1080 at 60 Hz. The built-in names match the files in `hdmi2csi2card/`:
 
 | File | Picture the source is asked for |
@@ -133,7 +135,7 @@ Each file has one preferred timing, an HDMI audio block, and stereo speakers. Th
 
 The command prints the media device, the bridge subdevice, and the video node it chose. Those numbers change from boot to boot. Later capture commands should use the video node from that output.
 
-`--no-test` configures the pipeline and does not capture frames. `--dry-run` prints the planned changes and does not change the device. `--media` takes a `/dev/mediaN` node. A symlink is accepted only when it points at another node under `/dev`. `--help` lists the flags.
+`--no-test` configures the pipeline and does not capture frames. `--dry-run` prints the planned changes and does not change the device. It does read the video node, so the plan can name the single-planar or multiplanar ioctl. `--media` takes a `/dev/mediaN` node. A symlink is accepted only when it points at another node under `/dev`. `--help` lists the flags.
 
 ```
 ./hdmi-in --help
@@ -157,10 +159,11 @@ It uses the same flags and the same exit statuses. The script can rewrite a bad 
 - Exit status 2: the cable, the source power, or the EDID mode does not match what the source will send. Connect the source and run the command again.
 - The source size does not match the EDID name: the command keeps the detected size and prints both. Some sources ignore EDID and keep an older mode.
 - The frame test writes no data: try `1080p30edid` or `720p60edid` before `1080p60edid`. Four lane RGB at 1080p60 needs a clean ribbon and a source that actually locks to that mode.
+- The video node will not capture RGB3 or BGR3: the command stops and prints the format the node accepted. `status` shows that format on the `video_format` line.
 
 ## Read a frame
 
-`csitest.yuv` is packed RGB, 3 bytes per pixel, with no file header. The width and height are the picture size the command printed.
+`csitest.yuv` is packed RGB, 3 bytes per pixel, with no file header and no line padding. Each frame is width times height times 3 bytes. The width and height are the ones on the `Video format` line, which is the size the video node accepted. The shell script writes the `v4l2-ctl` stream instead, and that stream keeps any line padding the driver inserted.
 
 To open the live node, install `python3-opencv` and use the video node from the command output in place of `/dev/videoX`:
 
